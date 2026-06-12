@@ -155,6 +155,8 @@ Set `NEOMAKE_LOG=debug` to turn on `tracing` diagnostics.
 | Environment access    | `env("PROFILE", "debug")`                                   |
 | File globbing         | `glob("src/**/*.rs")`                                       |
 | Command execution     | `exec("git rev-parse HEAD")`                                |
+| Git clone             | `git("github:owner/repo", "v1.0.0", "dest/%")`               |
+| File download         | `fetch("https://url.com/file", "dest/%")`                    |
 
 See [`docs/tomlx-spec.md`](docs/tomlx-spec.md) for the full grammar and
 semantics, and [`examples/advanced.tomlx`](examples/advanced.tomlx) for

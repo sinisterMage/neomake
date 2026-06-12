@@ -13,6 +13,15 @@ globset = { workspace = true }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+reqwest = { workspace = true }
+git2 = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+xz2 = { workspace = true }
+url = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+neomake-core = { path = "../neomake-core" }
 
 [target.'cfg(windows)'.dependencies]
 which = { workspace = true }

@@ -104,6 +104,13 @@ pub enum Expr {
         /// Expression when `cond` is false.
         else_branch: Box<Expr>,
     },
+    /// `name = value` keyword argument inside a function call.
+    KeywordArg {
+        /// Parameter name.
+        name: String,
+        /// Parameter value.
+        value: Box<Expr>,
+    },
 }
 
 /// Parse a token stream into a single [`Expr`].
@@ -287,7 +294,29 @@ impl Parser {
                     let mut args = Vec::new();
                     if !matches!(self.peek().map(|t| &t.token), Some(Token::RParen)) {
                         loop {
-                            args.push(self.parse_expr()?);
+                            // lookahead: Ident Eq means keyword arg
+                            let is_kwarg = matches!(
+                                (self.tokens.get(self.pos), self.tokens.get(self.pos + 1)),
+                                (
+                                    Some(SpannedToken { token: Token::Ident(_), .. }),
+                                    Some(SpannedToken { token: Token::Eq, .. })
+                                )
+                            );
+                            if is_kwarg {
+                                let kw_tok = self.bump().unwrap();
+                                let kw_name = match kw_tok.token {
+                                    Token::Ident(n) => n,
+                                    _ => unreachable!(),
+                                };
+                                self.bump(); // eat Eq
+                                let value = self.parse_expr()?;
+                                args.push(Expr::KeywordArg {
+                                    name: kw_name,
+                                    value: Box::new(value),
+                                });
+                            } else {
+                                args.push(self.parse_expr()?);
+                            }
                             if !self.eat(&Token::Comma) {
                                 break;
                             }
@@ -444,6 +473,37 @@ mod tests {
         let e = parse(r#"["a", 1, true]"#).unwrap();
         match e {
             Expr::Array(items) => assert_eq!(items.len(), 3),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_keyword_args_in_call() {
+        let e = parse(r#"git("repo", "tag", "dest", submodules = true, depth = 1)"#).unwrap();
+        match e {
+            Expr::Call { name, args, .. } => {
+                assert_eq!(name, "git");
+                assert_eq!(args.len(), 5);
+                // first 3 are positional strings
+                assert!(matches!(&args[0], Expr::LitStr(_)));
+                assert!(matches!(&args[1], Expr::LitStr(_)));
+                assert!(matches!(&args[2], Expr::LitStr(_)));
+                // last 2 are keyword args
+                match &args[3] {
+                    Expr::KeywordArg { name, value } => {
+                        assert_eq!(name, "submodules");
+                        assert!(matches!(**value, Expr::Bool(true)));
+                    }
+                    other => panic!("expected KeywordArg, got {other:?}"),
+                }
+                match &args[4] {
+                    Expr::KeywordArg { name, value } => {
+                        assert_eq!(name, "depth");
+                        assert!(matches!(**value, Expr::Int(1)));
+                    }
+                    other => panic!("expected KeywordArg, got {other:?}"),
+                }
+            }
             other => panic!("{other:?}"),
         }
     }

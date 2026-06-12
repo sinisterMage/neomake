@@ -94,15 +94,16 @@ fn has_tomlx_markers(source: &str) -> bool {
             }
         }
     }
-    // `${` appears only in TOMLX interpolation — never in vanilla TOML string
-    // literals unless the user intentionally wrote it, which is fine because
-    // interpolation only resolves when a matching variable is in scope.
+    // ${ appears only in TOMLX interpolation
     if source.contains("${") {
         return true;
     }
-    // A value-level conditional. We require a leading whitespace boundary to
-    // avoid flagging the word "if" inside identifiers or comments-ish text.
+    // A value-level conditional.
     if source.contains("= if ") || source.contains(" =if ") {
+        return true;
+    }
+    // Bare function calls or evaluator expressions
+    if source.contains("git(") || source.contains("fetch(") {
         return true;
     }
     false
@@ -176,6 +177,15 @@ fn preprocess(source: &str, path: &Path) -> Result<String, TomlxError> {
                 out.push_str(newline);
                 continue;
             }
+        }
+
+        if trimmed.starts_with("git(") || trimmed.starts_with("fetch(") {
+            let (expr_src, _trailing_comment) = strip_inline_comment(trimmed);
+            let base_span = Span::new(path, line_no, column_of(body, expr_src));
+            let expr = parse_source_expr(expr_src.trim(), &base_span)?;
+            let _ = evaluate(&expr, &scope)?;
+            out.push_str(newline);
+            continue;
         }
 
         // Fallthrough: verbatim.
@@ -287,7 +297,7 @@ fn value_contains_tomlx_sentinel(value_raw: &str) -> bool {
         return true;
     }
     // Built-in function at the top level of the RHS.
-    for name in ["env(", "glob(", "exec("] {
+    for name in ["env(", "glob(", "exec(", "git(", "fetch("] {
         if trimmed.starts_with(name) || trimmed.contains(&format!(" {name}")) {
             return true;
         }
@@ -364,6 +374,10 @@ fn evaluate(expr: &Expr, scope: &Scope) -> Result<toml::Value, TomlxError> {
             let v = evaluate(expr, scope)?;
             apply_unary(*op, &v)
         }
+        Expr::KeywordArg { .. } => Err(TomlxError::at_unknown(
+            std::path::PathBuf::new(),
+            "keyword arguments are only valid inside function calls",
+        )),
         Expr::If {
             cond,
             then_branch,
@@ -500,25 +514,37 @@ fn call_builtin(
     span: &Span,
 ) -> Result<toml::Value, TomlxError> {
     let mk_err = |msg: String| TomlxError::new(&span.file, span.line, span.col, msg);
-    let eval_args: Vec<toml::Value> = args
-        .iter()
-        .map(|a| evaluate(a, scope))
-        .collect::<Result<_, _>>()?;
+    
+    let mut positional = Vec::new();
+    let mut kwargs = BTreeMap::new();
+    for arg in args {
+        match arg {
+            Expr::KeywordArg { name, value } => {
+                kwargs.insert(name.as_str(), evaluate(value, scope)?);
+            }
+            _ => {
+                positional.push(evaluate(arg, scope)?);
+            }
+        }
+    }
 
     match name {
         "env" => {
-            if eval_args.is_empty() || eval_args.len() > 2 {
+            if !kwargs.is_empty() {
+                return Err(mk_err("env() does not accept keyword arguments".into()));
+            }
+            if positional.is_empty() || positional.len() > 2 {
                 return Err(mk_err(format!(
                     "env() expects 1 or 2 arguments, got {}",
-                    eval_args.len()
+                    positional.len()
                 )));
             }
-            let key = expect_string(&eval_args[0], "env() first argument", &mk_err)?;
+            let key = expect_string(&positional[0], "env() first argument", &mk_err)?;
             match std::env::var(&key) {
                 Ok(v) => Ok(toml::Value::String(v)),
                 Err(_) => {
-                    if eval_args.len() == 2 {
-                        Ok(eval_args[1].clone())
+                    if positional.len() == 2 {
+                        Ok(positional[1].clone())
                     } else {
                         Err(mk_err(format!(
                             "environment variable `{key}` not set (use env(\"{key}\", \"default\") to provide a fallback)"
@@ -528,13 +554,16 @@ fn call_builtin(
             }
         }
         "glob" => {
-            if eval_args.len() != 1 {
+            if !kwargs.is_empty() {
+                return Err(mk_err("glob() does not accept keyword arguments".into()));
+            }
+            if positional.len() != 1 {
                 return Err(mk_err(format!(
                     "glob() expects 1 argument, got {}",
-                    eval_args.len()
+                    positional.len()
                 )));
             }
-            let pat = expect_string(&eval_args[0], "glob() argument", &mk_err)?;
+            let pat = expect_string(&positional[0], "glob() argument", &mk_err)?;
             let mut builder = GlobSetBuilder::new();
             let glob = GlobBuilder::new(&pat)
                 .literal_separator(true)
@@ -581,13 +610,16 @@ fn call_builtin(
             ))
         }
         "exec" => {
-            if eval_args.len() != 1 {
+            if !kwargs.is_empty() {
+                return Err(mk_err("exec() does not accept keyword arguments".into()));
+            }
+            if positional.len() != 1 {
                 return Err(mk_err(format!(
                     "exec() expects 1 argument, got {}",
-                    eval_args.len()
+                    positional.len()
                 )));
             }
-            let cmd = expect_string(&eval_args[0], "exec() argument", &mk_err)?;
+            let cmd = expect_string(&positional[0], "exec() argument", &mk_err)?;
             let invocation = shell::resolve();
             let output = Command::new(&invocation.program)
                 .args(&invocation.args)
@@ -606,6 +638,81 @@ fn call_builtin(
                 .to_string();
             Ok(toml::Value::String(stdout))
         }
+        "git" => {
+            if positional.len() != 3 {
+                return Err(mk_err(format!("git() expects 3 positional arguments, got {}", positional.len())));
+            }
+            let repo = expect_string(&positional[0], "git() repo", &mk_err)?;
+            let tag = expect_string(&positional[1], "git() tag", &mk_err)?;
+            let dest_template = expect_string(&positional[2], "git() dest", &mk_err)?;
+
+            let submodules = if let Some(v) = kwargs.get("submodules") {
+                expect_bool(v, "git() submodules", &mk_err)?
+            } else {
+                false
+            };
+
+            let depth = if let Some(v) = kwargs.get("depth") {
+                Some(expect_int(v, "git() depth", &mk_err)? as u32)
+            } else {
+                None
+            };
+
+            let basename = crate::fetch::extract_basename(&repo);
+            let dest = crate::fetch::resolve_wildcard(&dest_template, &basename, None);
+
+            let (path, sha) = crate::fetch::git_clone(&repo, &tag, &dest, submodules, depth)
+                .map_err(|e| mk_err(format!("git() error: {e}")))?;
+
+            let mut manifest = neomake_core::asset::AssetManifest::load(&scope.base_dir);
+            manifest.add(path.clone(), neomake_core::asset::AssetRecord {
+                kind: neomake_core::asset::AssetKind::Git { commit_sha: sha },
+                source: repo,
+            });
+            manifest.save(&scope.base_dir);
+
+            Ok(toml::Value::String(path.to_string_lossy().to_string()))
+        }
+        "fetch" => {
+            if positional.len() != 2 {
+                return Err(mk_err(format!("fetch() expects 2 positional arguments, got {}", positional.len())));
+            }
+            let url = expect_string(&positional[0], "fetch() url", &mk_err)?;
+            let dest_template = expect_string(&positional[1], "fetch() dest", &mk_err)?;
+
+            let sha256_expected = if let Some(v) = kwargs.get("sha256") {
+                Some(expect_string(v, "fetch() sha256", &mk_err)?)
+            } else {
+                None
+            };
+
+            let alias = if let Some(v) = kwargs.get("alias") {
+                Some(expect_string(v, "fetch() alias", &mk_err)?)
+            } else {
+                None
+            };
+
+            let extract = if let Some(v) = kwargs.get("extract") {
+                expect_bool(v, "fetch() extract", &mk_err)?
+            } else {
+                false
+            };
+
+            let basename = crate::fetch::extract_basename(&url);
+            let dest = crate::fetch::resolve_wildcard(&dest_template, &basename, alias.as_deref());
+
+            let (path, sha) = crate::fetch::http_fetch(&url, &dest, sha256_expected.as_deref(), extract)
+                .map_err(|e| mk_err(format!("fetch() error: {e}")))?;
+
+            let mut manifest = neomake_core::asset::AssetManifest::load(&scope.base_dir);
+            manifest.add(path.clone(), neomake_core::asset::AssetRecord {
+                kind: neomake_core::asset::AssetKind::Fetch { content_sha256: sha },
+                source: url,
+            });
+            manifest.save(&scope.base_dir);
+
+            Ok(toml::Value::String(path.to_string_lossy().to_string()))
+        }
         other => Err(mk_err(format!("unknown function `{other}`"))),
     }
 }
@@ -619,6 +726,34 @@ fn expect_string(
         toml::Value::String(s) => Ok(s.clone()),
         other => Err(mk_err(format!(
             "{label} must be string, got {}",
+            type_of(other)
+        ))),
+    }
+}
+
+fn expect_bool(
+    v: &toml::Value,
+    label: &str,
+    mk_err: &dyn Fn(String) -> TomlxError,
+) -> Result<bool, TomlxError> {
+    match v {
+        toml::Value::Boolean(b) => Ok(*b),
+        other => Err(mk_err(format!(
+            "{label} must be boolean, got {}",
+            type_of(other)
+        ))),
+    }
+}
+
+fn expect_int(
+    v: &toml::Value,
+    label: &str,
+    mk_err: &dyn Fn(String) -> TomlxError,
+) -> Result<i64, TomlxError> {
+    match v {
+        toml::Value::Integer(i) => Ok(*i),
+        other => Err(mk_err(format!(
+            "{label} must be integer, got {}",
             type_of(other)
         ))),
     }

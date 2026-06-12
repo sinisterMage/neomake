@@ -110,8 +110,16 @@ impl Cache {
 
         hasher.update(b"inputs:\n");
         let inputs = expand_globs(&self.root, &task.inputs)?;
+        let manifest = crate::asset::AssetManifest::load(&self.root);
         for (rel, abs) in &inputs {
-            let content_hash = hash_file(abs)?;
+            let content_hash = if let Some(asset) = manifest.assets.get(abs) {
+                match &asset.kind {
+                    crate::asset::AssetKind::Git { commit_sha } => commit_sha.clone(),
+                    crate::asset::AssetKind::Fetch { content_sha256 } => content_sha256.clone(),
+                }
+            } else {
+                hash_file(abs)?
+            };
             hasher.update(normalize_rel(rel).as_bytes());
             hasher.update(b":");
             hasher.update(content_hash.as_bytes());

@@ -88,6 +88,8 @@ pub enum Token {
     OrOr,
     /// `!`
     Bang,
+    /// `=` (bare equals, for keyword args in function calls)
+    Eq,
 }
 
 /// A segment inside a template (double-quoted) string.
@@ -273,7 +275,12 @@ impl<'a> Lexer<'a> {
                         span,
                     }));
                 }
-                return Err(self.err("unexpected `=` (did you mean `==`?)"));
+                // bare = for keyword args like `depth = 1`
+                self.bump();
+                return Ok(Some(SpannedToken {
+                    token: Token::Eq,
+                    span,
+                }));
             }
             b'!' => {
                 if self.peek_at(1) == Some(b'=') {
@@ -643,5 +650,20 @@ mod tests {
         assert!(toks
             .iter()
             .any(|t| matches!(t, Token::Ident(s) if s == "env")));
+    }
+
+    #[test]
+    fn lexes_bare_eq_for_kwargs() {
+        let toks = tokens("depth = 1");
+        assert_eq!(
+            toks,
+            vec![Token::Ident("depth".into()), Token::Eq, Token::Int(1)]
+        );
+    }
+
+    #[test]
+    fn eq_eq_still_works() {
+        let toks = tokens("a == b");
+        assert!(toks.contains(&Token::EqEq));
     }
 }

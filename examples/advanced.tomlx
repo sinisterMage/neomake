@@ -25,3 +25,7 @@ env     = { RUST_LOG = "info" }
 [tasks.test]
 command = if ${profile} == "release" { "cargo test --release" } else { "cargo test" }
 deps    = ["build"]
+
+[tasks.download]
+git('sinisterMage/neomake', 'main', 'neomake/%')
+command = "echo" 'successfully cloned '
